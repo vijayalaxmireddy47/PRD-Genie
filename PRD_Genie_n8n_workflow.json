@@ -1,0 +1,908 @@
+{
+  "name": "PRD Genie - AI-Powered Product Documentation Assistant",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "prd-genie",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "4184b676-7780-4241-b9b1-c54fd6ad879d",
+      "name": "PRD Genie API (POST /prd-genie)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "892c424e-2bc0-4eac-a53c-6393541f93c6"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Normalises the POST body of the PRD Genie API into the pipeline's input shape.\n// Body fields:\n//   input_text   (string)  transcript / brief / notes (also accepts \"transcript\" or \"text\")\n//   input_type   (string)  optional hint: meeting_transcript | product_brief | stakeholder_notes | meeting_notes\n//   mode         (string)  full (default) | extract_only | from_extraction\n//   extraction   (object)  required for mode=from_extraction (the PM-reviewed output of an extract_only run)\n//   test_id      (string)  optional: T1..T10 to run the baseline eval checks on this input\n//   product_name (string)  optional hint\nconst b = $json.body || {};\nconst mode = ['full', 'extract_only', 'from_extraction'].includes(b.mode) ? b.mode : 'full';\nreturn {\n  json: {\n    source: 'webhook',\n    test_id: b.test_id || null,\n    input_type: b.input_type || 'auto',\n    mode,\n    product_name: b.product_name || null,\n    input_text: (b.input_text || b.transcript || b.text || '').toString(),\n    reviewed_extraction: b.extraction ?? null,\n  },\n};\n"
+      },
+      "id": "876c6607-0257-4691-8026-2250d9952b60",
+      "name": "Normalize API Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "db797243-8707-42ef-9876-995f7646d3ad",
+      "name": "Called by Eval Harness",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        220,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ===================== PRD GENIE CONFIG — edit these values =====================\nconst CONFIG = {\n  llm_base_url: 'https://api.openai.com/v1',   // any OpenAI-compatible /chat/completions endpoint\n  model: 'gpt-4.1-mini',                       // model used by all 5 agents\n  temperature: 0,                              // set to null for models that reject temperature\n  price_per_1m_input_usd: 0.40,                // used for per-run cost tracking\n  price_per_1m_output_usd: 1.60,\n  langfuse_enabled: true,                      // set false to skip observability\n  langfuse_host: 'https://cloud.langfuse.com', // or https://us.cloud.langfuse.com / self-hosted URL\n};\n// ================================================================================\n\n// Company PRD template (Resources/prd_template.md) — the PRD Generator must follow it exactly.\nconst PRD_TEMPLATE = `# Product Requirements Document (PRD) Template\n\n## 1. Product Overview\n- **Product Name:**\n- **Document Version:**\n- **Author:**\n- **Date:**\n- **Status:** [Draft / In Review / Approved]\n\n## 2. Goals and Objectives\n- **Business Goal:** What business outcome does this feature drive?\n- **User Goal:** What problem does this solve for the user?\n- **Success Metrics:** How will we measure success? (list 2-3 KPIs)\n\n## 3. User Personas\nFor each persona, describe:\n- **Name / Role:**\n- **Key Need:**\n- **Current Workaround:**\n\n## 4. Feature Requirements\n\n### 4.1 Functional Requirements\n| ID | Requirement | Priority (Must/Should/Nice) | Source |\n|----|-------------|---------------------------|--------|\n| FR-001 | | | |\n| FR-002 | | | |\n\n### 4.2 Non-Functional Requirements\n| ID | Requirement | Category | Target |\n|----|-------------|----------|--------|\n| NFR-001 | | Performance | |\n| NFR-002 | | Security | |\n\n## 5. Acceptance Criteria\nFor each key feature, list specific testable criteria:\n- **Feature X:**\n  - [ ] Criteria 1\n  - [ ] Criteria 2\n\n## 6. Out of Scope\nList what is explicitly NOT included in this release.\n\n## 7. Dependencies\n| Dependency | Owner | Status | Risk |\n|-----------|-------|--------|------|\n| | | | |\n\n## 8. Assumptions\nList assumptions made during requirement gathering.\n\n## 9. Open Questions\nList unresolved items that need stakeholder input.\n\n## 10. Timeline\n| Milestone | Target Date |\n|-----------|-------------|\n| Design Complete | |\n| Development Start | |\n| QA / Testing | |\n| Launch | |`;\n\nconst rid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);\nconst ctx = {\n  source: $json.source || 'eval',\n  test_id: $json.test_id || null,\n  input_type: $json.input_type || 'auto',\n  mode: $json.mode || 'full',\n  product_name: $json.product_name || null,\n  input_text: ($json.input_text || '').toString(),\n  config: CONFIG,\n  prd_template: PRD_TEMPLATE,\n  run_id: `prdgenie-${$execution.id}-${$json.test_id || 'run'}-${rid()}`,\n  started_at: new Date().toISOString(),\n  human_reviewed: false,\n  trace: [],\n};\n\n// route: 0 = extract from source, 1 = skip to PRD (PM-reviewed extraction), 2 = stop (nothing to process)\nif (ctx.mode === 'from_extraction') {\n  let ex = $json.reviewed_extraction;\n  if (typeof ex === 'string') { try { ex = JSON.parse(ex); } catch (e) { ex = null; } }\n  if (ex && typeof ex === 'object') {\n    ctx.extraction = ex;\n    ctx.human_reviewed = true;\n    ctx.route = ex.input_assessment?.sufficiency === 'insufficient' ? 2 : 1;\n  } else {\n    ctx.error = 'mode \"from_extraction\" requires an \"extraction\" object (the reviewed output of an extract_only run).';\n    ctx.route = 2;\n  }\n} else if (ctx.input_text.trim().length === 0) {\n  // Deterministic guard: never call the LLM (or generate a PRD) from nothing.\n  ctx.extraction = {\n    input_assessment: { input_type: ctx.input_type, sufficiency: 'insufficient', sufficiency_reason: 'Input text is empty.', summary: '' },\n    requirements: [],\n    missing_information: [{ area: 'Everything', question: 'No transcript or notes were provided. Please supply the meeting transcript, brief or notes.' }],\n  };\n  ctx.route = 2;\n} else {\n  ctx.route = 0;\n}\nreturn { json: ctx };\n"
+      },
+      "id": "44adffd9-93c4-4221-bfb3-0dbe5033759d",
+      "name": "Pipeline Config & Guard",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 3,
+        "output": "={{ $json.route }}"
+      },
+      "id": "8d3115d6-a606-4cf8-af73-dbc397c36244",
+      "name": "Route: Entry",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        660,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Agent 1 — Requirement Extractor: parses the source, separates stated vs ambiguous, quotes evidence.\nconst SYSTEM = `You are the REQUIREMENT EXTRACTOR agent of \"PRD Genie\", a sequential multi-agent pipeline\n(Requirement Extractor -> PRD Generator -> Story Breakdown -> Gap Analyzer + Scope Estimator).\n\nYour ONLY job is to extract what is actually present in the SOURCE text. You are a careful analyst, not a product designer.\n\nGROUNDING RULES (non-negotiable)\n1. Use ONLY the SOURCE text. Do not use general product knowledge, industry best practice or competitor knowledge to add anything.\n2. Every extracted item MUST carry \"source_quote\": an exact, verbatim, contiguous substring copied from the SOURCE (keep original spelling and punctuation). If you cannot quote it, do not extract it.\n3. Preserve exact numbers, units, versions, names and dates (e.g. \"10,000\", \"< 200ms\", \"p95\", \"v52\", \"Q3\"). Never round, convert or paraphrase numbers.\n4. Never fill gaps. Anything unknown goes into \"missing_information\" as a question - never a guess.\n5. Do not resolve conflicts or pick a winner. Report every viewpoint neutrally and separately.\n6. Empty categories are []. Never output placeholder items.\n\nCLASSIFICATION\n- certainty: \"stated\" = explicit, specific statement of need; \"ambiguous\" = vague, subjective, comparative or incomplete (\"better\", \"smarter\", \"something like Competitor X\", \"real-time\" with no target, \"TBD\", \"something about ...\").\n- type: \"functional\" (what the system/user does), \"non_functional\" (performance, scalability, availability, security, compliance, integration, compatibility, usability, accessibility) or \"constraint\" (budget, deadline, technology, platform, policy limits).\n- nfr_category for non_functional: Performance | Scalability | Security | Integration | Availability | Compliance | Usability | Accessibility | Compatibility | Other.\n- priority_signal: \"must\" only when the source says must / required / hard requirement / critical; \"should\" for should / need / want; \"nice\" for nice to have / not critical / would be nice; otherwise \"unspecified\".\n- acceptance_criteria_verbatim: conditions the SOURCE states a feature must satisfy (e.g. \"PDF must include company logo\"), copied verbatim onto the parent requirement. Do not invent criteria.\n- personas: only user types explicitly named in the SOURCE (e.g. \"Admins\", \"End users\", \"Auditors\"). Keep each one separate; never merge them into a generic \"user\".\n- stakeholders: people, teams or roles in the SOURCE with each viewpoint they expressed.\n- contradictions: statements that cannot both be satisfied as stated, or competing stakeholder positions (e.g. \"auto-refresh every 5 seconds\" vs \"minimize API calls\"; competing architectures; aggressive deadline vs open scope). Quote both sides; set needs_stakeholder_resolution to true.\n- dependencies: anything the work relies on (other teams, services, decisions, data). Record owner/status exactly as stated; if ETA or status is unknown/TBD write \"unknown\" and describe the resulting risk.\n- decisions_pending: items explicitly deferred (\"TBD\", \"discuss offline\", \"decide later\").\n\nSUFFICIENCY\n- \"insufficient\": no concrete, actionable requirement can be extracted (empty notes, \"meeting happened\", only vague wishes, fragmentary notes where subject or target is unclear). Then requirements may only contain items with certainty \"ambiguous\" (or be empty) and missing_information MUST list what is missing.\n- \"partial\": some concrete requirements but important gaps (users, metrics, scope, owner, timeline).\n- \"sufficient\": concrete requirements with enough detail to draft a PRD.\n\nReturn ONLY one JSON object with exactly this shape:\n{\n  \"input_assessment\": {\"input_type\": \"meeting_transcript | product_brief | stakeholder_notes | meeting_notes | one_liner | other\", \"sufficiency\": \"sufficient | partial | insufficient\", \"sufficiency_reason\": \"string\", \"summary\": \"1-3 sentence neutral summary of what the source actually says\"},\n  \"product_context\": {\"product_or_feature_name\": \"string or null\", \"problem_statement\": \"string or null (only if stated)\"},\n  \"stakeholders\": [{\"name\": \"string\", \"role\": \"string or null\", \"viewpoints\": [\"string\"], \"source_quote\": \"verbatim\"}],\n  \"personas\": [{\"name\": \"string\", \"needs\": [\"string\"], \"current_workaround\": \"string or null\", \"source_quote\": \"verbatim\"}],\n  \"requirements\": [{\"id\": \"REQ-001\", \"statement\": \"concise restatement that adds no detail\", \"type\": \"functional | non_functional | constraint\", \"nfr_category\": \"string or null\", \"certainty\": \"stated | ambiguous\", \"priority_signal\": \"must | should | nice | unspecified\", \"persona\": \"string or null\", \"acceptance_criteria_verbatim\": [\"verbatim condition\"], \"metrics\": [{\"value\": \"verbatim number or threshold\", \"unit\": \"string\", \"context\": \"string\"}], \"speaker\": \"string or null\", \"source_quote\": \"verbatim\"}],\n  \"deadlines\": [{\"description\": \"string\", \"date_or_period\": \"verbatim\", \"owner\": \"string or null\", \"source_quote\": \"verbatim\"}],\n  \"assumptions_in_source\": [{\"statement\": \"string\", \"source_quote\": \"verbatim\"}],\n  \"dependencies\": [{\"description\": \"string\", \"owner\": \"string or null\", \"status\": \"string or 'unknown'\", \"eta\": \"verbatim or 'unknown'\", \"risk\": \"string or null\", \"source_quote\": \"verbatim\"}],\n  \"contradictions\": [{\"topic\": \"string\", \"statement_a\": \"string\", \"source_a\": \"verbatim\", \"statement_b\": \"string\", \"source_b\": \"verbatim\", \"stakeholders_involved\": [\"string\"], \"needs_stakeholder_resolution\": true}],\n  \"ambiguities\": [{\"item\": \"string\", \"why_ambiguous\": \"string\", \"source_quote\": \"verbatim\"}],\n  \"decisions_pending\": [{\"topic\": \"string\", \"owner\": \"string or null\", \"source_quote\": \"verbatim\"}],\n  \"out_of_scope_mentions\": [{\"item\": \"string\", \"source_quote\": \"verbatim\"}],\n  \"missing_information\": [{\"area\": \"string\", \"question\": \"specific clarification question for stakeholders\"}]\n}`;\n\nconst USER = `INPUT TYPE HINT: ${$json.input_type}\n${$json.product_name ? 'PRODUCT NAME HINT: ' + $json.product_name + '\\n' : ''}\nSOURCE (everything between the markers, nothing else):\n<<<SOURCE\n${$json.input_text}\nSOURCE>>>`;\n\nfunction buildRequest(system, user) {\n  const c = $json.config;\n  const req = {\n    model: c.model,\n    response_format: { type: 'json_object' },\n    messages: [{ role: 'system', content: system }, { role: 'user', content: user }],\n  };\n  if (c.temperature !== null && c.temperature !== undefined) req.temperature = c.temperature;\n  return { json: { ...$json, _stage_start: new Date().toISOString(), llm_request: req } };\n}\n\nreturn buildRequest(SYSTEM, USER);\n"
+      },
+      "id": "0ab575d8-ff7c-4298-96ae-ca5f2da0c540",
+      "name": "Prepare Extractor Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.config.llm_base_url }}/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.llm_request) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "id": "390b7c8e-8779-4ebe-b3f3-7501f5da86f6",
+      "name": "Agent 1: Requirement Extractor",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        280
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "\nfunction parseLLM(resp) {\n  const raw = resp?.choices?.[0]?.message?.content ?? '';\n  try { return JSON.parse(raw); } catch (e) {\n    const m = raw.match(/\\{[\\s\\S]*\\}/);\n    if (m) { try { return JSON.parse(m[0]); } catch (e2) {} }\n    return { _parse_error: true, _raw: raw };\n  }\n}\nfunction traceEntry(stage, prev, resp, parsed) {\n  return {\n    stage,\n    model: resp.model || prev.config.model,\n    start_time: prev._stage_start,\n    end_time: new Date().toISOString(),\n    input: prev.llm_request.messages,\n    output: parsed,\n    usage: { input: resp.usage?.prompt_tokens || 0, output: resp.usage?.completion_tokens || 0 },\n  };\n}\nfunction nextCtx(prevNodeName, stage) {\n  const prev = $(prevNodeName).item.json;\n  const parsed = parseLLM($json);\n  const ctx = { ...prev };\n  delete ctx.llm_request;\n  delete ctx._stage_start;\n  return { ctx, parsed, entry: traceEntry(stage, prev, $json, parsed) };\n}\n\nconst { ctx, parsed, entry } = nextCtx('Prepare Extractor Prompt', 'requirement_extractor');\nctx.trace = [...ctx.trace, entry];\nctx.extraction = parsed;\n\n// route: 0 = continue to PRD generation, 1 = stop and assemble (extract_only / insufficient / error)\nif (parsed._parse_error) {\n  ctx.error = 'Requirement Extractor returned invalid JSON.';\n  ctx.route = 1;\n  return { json: ctx };\n}\nconst stated = (parsed.requirements || []).filter(r => r.certainty === 'stated');\nif (parsed.input_assessment?.sufficiency === 'insufficient') {\n  ctx.stop_reason = 'Extractor flagged the input as insufficient.';\n  ctx.route = 1;\n} else if (stated.length === 0) {\n  // Deterministic guard: only ambiguous items -> do not let later agents invent a PRD.\n  parsed.input_assessment = { ...(parsed.input_assessment || {}), sufficiency: 'insufficient',\n    sufficiency_reason: (parsed.input_assessment?.sufficiency_reason || '') + ' [PRD Genie guard: no stated requirements, only ambiguous items.]' };\n  ctx.stop_reason = 'No stated (concrete) requirements were found.';\n  ctx.route = 1;\n} else if (ctx.mode === 'extract_only') {\n  ctx.route = 1;\n} else {\n  ctx.route = 0;\n}\nreturn { json: ctx };\n"
+      },
+      "id": "afa98ee9-4c46-45eb-a451-293f1ab6052d",
+      "name": "Parse Extraction",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 2,
+        "output": "={{ $json.route }}"
+      },
+      "id": "5399e791-553f-464b-804a-37a16996f9b9",
+      "name": "Route: After Extraction",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        1560,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Agent 2 — PRD Generator: structures the extraction into the company PRD template.\nconst SYSTEM = `You are the PRD GENERATOR agent of \"PRD Genie\". You turn a structured requirement EXTRACTION into a PRD that follows the company TEMPLATE exactly.\n\nRULES\n1. Content must come ONLY from the EXTRACTION JSON (the SOURCE is given for verification). Never add features, requirements, metrics, personas, dates, owners or numbers that are not there. No general product knowledge.\n2. Keep every section and heading of the TEMPLATE, in the same order and numbering (sections 1-10, including 4.1 and 4.2). If a section has no source content write \"_Not specified in source - see Open Questions._\" Never drop a section.\n3. 4.1 Functional Requirements table: one row per functional requirement with certainty \"stated\" (IDs FR-001, FR-002 ...). Priority column: Must / Should / Nice mapped from priority_signal; \"unspecified\" -> \"TBD\". Source column: the REQ id plus speaker if known, e.g. \"REQ-001 (Sarah)\".\n4. 4.2 Non-Functional Requirements table: every non_functional requirement and every quantitative constraint, Category from nfr_category, Target copied verbatim (no rounding, no unit conversion).\n5. 5. Acceptance Criteria: use acceptance_criteria_verbatim exactly as written, as \"- [ ]\" items. Where a requirement has none, only restate what the requirement itself makes testable and suffix \"(derived from REQ-xxx)\". Never add new conditions.\n6. Ambiguous items are NOT firm requirements: list them in 9. Open Questions as \"AMBIGUOUS: ...\" with what must be clarified.\n7. Contradictions: list each in 9. Open Questions as \"CONFLICT: <side A> vs <side B> - needs stakeholder resolution (<stakeholders>)\" without choosing a side. Also list decisions_pending and missing_information there.\n8. 8. Assumptions: only assumptions stated in the source. If you had to interpret something, list it prefixed with \"[PRD Genie interpretation - confirm]\". If none: \"None stated in source.\"\n9. 7. Dependencies table: from the extraction; unknown status/ETA -> Status \"Unknown\" and Risk \"High - ETA unknown\" (or the stated risk).\n10. 10. Timeline: fill only dates or periods stated in the source; all others \"TBD\".\n11. 1. Product Overview: Product Name from the extraction (or \"TBD\"), Document Version \"0.1 (AI draft)\", Status \"Draft\", Date = TODAY, Author = \"PRD Genie (AI draft) - Owner: <PM name if stated, else TBD>\".\n12. Success Metrics: only measurable targets stated in the source; otherwise \"TBD - needs stakeholder input\". Persona \"Current Workaround\": only if stated, else \"Not stated\".\n13. 6. Out of Scope: only items the source explicitly excludes or defers; otherwise \"Not specified in source\".\n\nReturn ONLY one JSON object:\n{\n  \"prd_markdown\": \"the full PRD in markdown, starting with '# Product Requirements Document (PRD)'\",\n  \"features\": [{\"feature_id\": \"F-01\", \"name\": \"string\", \"requirement_ids\": [\"REQ-001\"], \"fr_ids\": [\"FR-001\"], \"nfr_ids\": [\"NFR-001\"]}],\n  \"sections_without_source_content\": [\"section names\"]\n}`;\n\nconst USER = `TODAY: ${new Date().toISOString().slice(0, 10)}\n${$json.human_reviewed ? 'NOTE: The EXTRACTION below was reviewed and approved by the PM (human-in-the-loop). Treat it as the source of truth.\\n' : ''}\nTEMPLATE:\n<<<TEMPLATE\n${$json.prd_template}\nTEMPLATE>>>\n\nEXTRACTION:\n<<<EXTRACTION\n${JSON.stringify($json.extraction, null, 2)}\nEXTRACTION>>>\n\nSOURCE:\n<<<SOURCE\n${$json.input_text || '(not provided - use the PM-reviewed extraction only)'}\nSOURCE>>>`;\n\nfunction buildRequest(system, user) {\n  const c = $json.config;\n  const req = {\n    model: c.model,\n    response_format: { type: 'json_object' },\n    messages: [{ role: 'system', content: system }, { role: 'user', content: user }],\n  };\n  if (c.temperature !== null && c.temperature !== undefined) req.temperature = c.temperature;\n  return { json: { ...$json, _stage_start: new Date().toISOString(), llm_request: req } };\n}\n\nreturn buildRequest(SYSTEM, USER);\n"
+      },
+      "id": "059d40ff-1b03-472b-8566-196a285e07cb",
+      "name": "Prepare PRD Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1800,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.config.llm_base_url }}/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.llm_request) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "id": "7386a610-c0e8-4b99-bcf9-2dc6ec70133c",
+      "name": "Agent 2: PRD Generator",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2020,
+        400
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "\nfunction parseLLM(resp) {\n  const raw = resp?.choices?.[0]?.message?.content ?? '';\n  try { return JSON.parse(raw); } catch (e) {\n    const m = raw.match(/\\{[\\s\\S]*\\}/);\n    if (m) { try { return JSON.parse(m[0]); } catch (e2) {} }\n    return { _parse_error: true, _raw: raw };\n  }\n}\nfunction traceEntry(stage, prev, resp, parsed) {\n  return {\n    stage,\n    model: resp.model || prev.config.model,\n    start_time: prev._stage_start,\n    end_time: new Date().toISOString(),\n    input: prev.llm_request.messages,\n    output: parsed,\n    usage: { input: resp.usage?.prompt_tokens || 0, output: resp.usage?.completion_tokens || 0 },\n  };\n}\nfunction nextCtx(prevNodeName, stage) {\n  const prev = $(prevNodeName).item.json;\n  const parsed = parseLLM($json);\n  const ctx = { ...prev };\n  delete ctx.llm_request;\n  delete ctx._stage_start;\n  return { ctx, parsed, entry: traceEntry(stage, prev, $json, parsed) };\n}\n\nconst { ctx, parsed, entry } = nextCtx('Prepare PRD Prompt', 'prd_generator');\nctx.trace = [...ctx.trace, entry];\nif (parsed._parse_error || !parsed.prd_markdown) ctx.error = 'PRD Generator returned invalid JSON.';\nctx.prd = parsed;\nreturn { json: ctx };\n"
+      },
+      "id": "4df8e6c7-7783-40a5-8fe5-ed8427c314fc",
+      "name": "Parse PRD",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2240,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Agent 3 — Story Breakdown: PRD features -> Epics -> Features -> User Stories with priority.\nconst SYSTEM = `You are the STORY BREAKDOWN agent of \"PRD Genie\". Convert the PRD into Epics -> Features -> User Stories.\n\nRULES\n1. Use only features and requirements present in the PRD and EXTRACTION. Add no new functionality.\n2. Every story uses the format: \"As a <persona>, I want <capability>, so that <benefit>.\"\n   - Use the specific persona named in the source (e.g. Admin, End User, Auditor, Finance team). When several personas are named, create SEPARATE stories per persona - never merge them into a generic \"user\". Use \"user\" only when the source names no persona.\n   - If the benefit is not stated in the source write \"so that <benefit to be confirmed by PM>\".\n3. Acceptance criteria per story: copy the verbatim acceptance criteria from the EXTRACTION/PRD (\"derived\": false). Only when a requirement has none, add criteria restating what the requirement itself makes testable (\"derived\": true). Do NOT add criteria the source does not support (no extra error handling, accessibility, edge cases, etc.).\n4. Priority per story: \"Must Have\" | \"Should Have\" | \"Nice to Have\", with a one-line rationale grounded in the source (e.g. \"stated as a hard requirement by Sarah\"). With no explicit signal, suggest one and say \"suggested - no explicit priority in source\".\n5. Non-functional requirements become acceptance criteria on the relevant stories, or an \"enabler\" story when they apply across stories. Keep numbers verbatim.\n6. Traceability: each story lists source_requirement_ids (REQ ids).\n7. Stories that depend on an unresolved conflict or ambiguity get \"status\": \"blocked - needs clarification\"; do not silently resolve the conflict.\n\nReturn ONLY one JSON object:\n{\"epics\": [{\"epic_id\": \"EP-01\", \"title\": \"string\", \"description\": \"string\", \"features\": [{\"feature_id\": \"F-01\", \"title\": \"string\", \"stories\": [{\"story_id\": \"US-001\", \"persona\": \"string\", \"story\": \"As a ..., I want ..., so that ...\", \"type\": \"user_story | enabler\", \"priority\": \"Must Have | Should Have | Nice to Have\", \"priority_rationale\": \"string\", \"acceptance_criteria\": [{\"text\": \"string\", \"derived\": false}], \"source_requirement_ids\": [\"REQ-001\"], \"status\": \"ready | blocked - needs clarification\"}]}]}]}`;\n\nconst USER = `PRD:\n<<<PRD\n${$json.prd?.prd_markdown || ''}\nPRD>>>\n\nPRD FEATURE MAP:\n${JSON.stringify($json.prd?.features || [], null, 2)}\n\nEXTRACTION (requirements, personas, contradictions, dependencies):\n${JSON.stringify({\n  personas: $json.extraction?.personas || [],\n  requirements: $json.extraction?.requirements || [],\n  contradictions: $json.extraction?.contradictions || [],\n  dependencies: $json.extraction?.dependencies || [],\n}, null, 2)}`;\n\nfunction buildRequest(system, user) {\n  const c = $json.config;\n  const req = {\n    model: c.model,\n    response_format: { type: 'json_object' },\n    messages: [{ role: 'system', content: system }, { role: 'user', content: user }],\n  };\n  if (c.temperature !== null && c.temperature !== undefined) req.temperature = c.temperature;\n  return { json: { ...$json, _stage_start: new Date().toISOString(), llm_request: req } };\n}\n\nreturn buildRequest(SYSTEM, USER);\n"
+      },
+      "id": "4f865b85-560b-4d57-b5ab-245a3124eeca",
+      "name": "Prepare Story Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2460,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.config.llm_base_url }}/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.llm_request) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "id": "1ccd99c4-8a95-4aca-a869-e1ac957a32e7",
+      "name": "Agent 3: Story Breakdown",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2680,
+        400
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "\nfunction parseLLM(resp) {\n  const raw = resp?.choices?.[0]?.message?.content ?? '';\n  try { return JSON.parse(raw); } catch (e) {\n    const m = raw.match(/\\{[\\s\\S]*\\}/);\n    if (m) { try { return JSON.parse(m[0]); } catch (e2) {} }\n    return { _parse_error: true, _raw: raw };\n  }\n}\nfunction traceEntry(stage, prev, resp, parsed) {\n  return {\n    stage,\n    model: resp.model || prev.config.model,\n    start_time: prev._stage_start,\n    end_time: new Date().toISOString(),\n    input: prev.llm_request.messages,\n    output: parsed,\n    usage: { input: resp.usage?.prompt_tokens || 0, output: resp.usage?.completion_tokens || 0 },\n  };\n}\nfunction nextCtx(prevNodeName, stage) {\n  const prev = $(prevNodeName).item.json;\n  const parsed = parseLLM($json);\n  const ctx = { ...prev };\n  delete ctx.llm_request;\n  delete ctx._stage_start;\n  return { ctx, parsed, entry: traceEntry(stage, prev, $json, parsed) };\n}\n\nconst { ctx, parsed, entry } = nextCtx('Prepare Story Prompt', 'story_breakdown');\nctx.trace = [...ctx.trace, entry];\nif (parsed._parse_error) ctx.error = 'Story Breakdown returned invalid JSON.';\nctx.stories = parsed;\nreturn { json: ctx };\n"
+      },
+      "id": "e7c00de9-d1ef-42c4-a8a5-16b555ddb0cd",
+      "name": "Parse Stories",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2900,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Agent 4 (extended) — Gap Analyzer: missing / ambiguous / conflicting info -> clarification questions.\nconst SYSTEM = `You are the GAP ANALYZER agent of \"PRD Genie\". Identify missing, ambiguous or conflicting information that would stop engineering from estimating or building, and write clarification questions for stakeholders.\n\nRULES\n- Use only the EXTRACTION, PRD and STORIES given. Do not answer the questions yourself and do not propose solutions as facts.\n- Every contradiction in the extraction must appear in conflicts_to_resolve, with each position quoted neutrally.\n- Unknown ETAs / owners on dependencies are risks.\n- Ask each question to the stakeholder named in the source who can answer it; use \"PM\" if nobody is named.\n\nReturn ONLY one JSON object:\n{\"readiness\": \"ready | needs_clarification | blocked\", \"readiness_reason\": \"string\",\n \"gaps\": [{\"gap_id\": \"GAP-01\", \"category\": \"Scope | Users/Personas | Metrics | NFR | Data | Dependency | Timeline | Ownership | Conflict | Budget | Other\", \"description\": \"string\", \"severity\": \"blocker | high | medium | low\", \"related_ids\": [\"REQ-001\", \"US-001\"], \"clarification_question\": \"string\", \"ask_whom\": \"string\"}],\n \"conflicts_to_resolve\": [{\"topic\": \"string\", \"positions\": [\"string\"], \"decision_owner\": \"string\"}],\n \"risks\": [{\"risk\": \"string\", \"likelihood\": \"high | medium | low\", \"impact\": \"high | medium | low\", \"mitigation_question\": \"string\"}]}`;\n\nconst USER = `EXTRACTION:\n${JSON.stringify($json.extraction, null, 2)}\n\nPRD:\n<<<PRD\n${$json.prd?.prd_markdown || ''}\nPRD>>>\n\nSTORIES:\n${JSON.stringify($json.stories, null, 2)}`;\n\nfunction buildRequest(system, user) {\n  const c = $json.config;\n  const req = {\n    model: c.model,\n    response_format: { type: 'json_object' },\n    messages: [{ role: 'system', content: system }, { role: 'user', content: user }],\n  };\n  if (c.temperature !== null && c.temperature !== undefined) req.temperature = c.temperature;\n  return { json: { ...$json, _stage_start: new Date().toISOString(), llm_request: req } };\n}\n\nreturn buildRequest(SYSTEM, USER);\n"
+      },
+      "id": "35ca9346-905c-44e8-9f15-fc7501cb64c9",
+      "name": "Prepare Gap Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3140,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.config.llm_base_url }}/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.llm_request) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "id": "86f3d9ea-597d-404c-932a-8b3267f9fd44",
+      "name": "Agent 4: Gap Analyzer",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3360,
+        280
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "\nfunction parseLLM(resp) {\n  const raw = resp?.choices?.[0]?.message?.content ?? '';\n  try { return JSON.parse(raw); } catch (e) {\n    const m = raw.match(/\\{[\\s\\S]*\\}/);\n    if (m) { try { return JSON.parse(m[0]); } catch (e2) {} }\n    return { _parse_error: true, _raw: raw };\n  }\n}\nfunction traceEntry(stage, prev, resp, parsed) {\n  return {\n    stage,\n    model: resp.model || prev.config.model,\n    start_time: prev._stage_start,\n    end_time: new Date().toISOString(),\n    input: prev.llm_request.messages,\n    output: parsed,\n    usage: { input: resp.usage?.prompt_tokens || 0, output: resp.usage?.completion_tokens || 0 },\n  };\n}\nfunction nextCtx(prevNodeName, stage) {\n  const prev = $(prevNodeName).item.json;\n  const parsed = parseLLM($json);\n  const ctx = { ...prev };\n  delete ctx.llm_request;\n  delete ctx._stage_start;\n  return { ctx, parsed, entry: traceEntry(stage, prev, $json, parsed) };\n}\n\nconst { ctx, parsed, entry } = nextCtx('Prepare Gap Prompt', 'gap_analyzer');\nctx.trace_gap = [entry];\nctx.gap_analysis = parsed;\nreturn { json: ctx };\n"
+      },
+      "id": "ec8afddc-509d-4a87-883c-d64d2a67aec9",
+      "name": "Parse Gaps",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3580,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Agent 5 (extended) — Scope Estimator: T-shirt size per story, flags underspecified stories.\nconst SYSTEM = `You are the SCOPE ESTIMATOR agent of \"PRD Genie\". Assign a T-shirt size (S / M / L / XL) to every story using only complexity signals visible in the STORIES and CONTEXT. Do NOT invent hours, dates or team sizes.\n\nSIZING GUIDE\n- S: single well-defined change, at most 2 acceptance criteria, no integration.\n- M: several acceptance criteria, or one integration, or UI + API work.\n- L: multiple components, strict NFR threshold (latency, concurrency), new data pipeline or export engine.\n- XL: cross-team dependency, new service, unresolved architecture decision or conflict - recommend splitting.\nFlag a story as underspecified when its persona, benefit, acceptance criteria or target values are missing/ambiguous, or it is blocked.\n\nReturn ONLY one JSON object:\n{\"estimates\": [{\"story_id\": \"US-001\", \"size\": \"S | M | L | XL\", \"complexity_signals\": [\"string\"], \"underspecified\": false, \"underspecified_reason\": \"string\", \"confidence\": \"high | medium | low\", \"split_recommendation\": \"string or null\"}],\n \"summary\": {\"S\": 0, \"M\": 0, \"L\": 0, \"XL\": 0, \"underspecified_count\": 0}}`;\n\nconst USER = `STORIES:\n${JSON.stringify($json.stories, null, 2)}\n\nCONTEXT (NFRs, dependencies, conflicts from the extraction):\n${JSON.stringify({\n  non_functional: ($json.extraction?.requirements || []).filter(r => r.type !== 'functional'),\n  dependencies: $json.extraction?.dependencies || [],\n  contradictions: $json.extraction?.contradictions || [],\n}, null, 2)}`;\n\nfunction buildRequest(system, user) {\n  const c = $json.config;\n  const req = {\n    model: c.model,\n    response_format: { type: 'json_object' },\n    messages: [{ role: 'system', content: system }, { role: 'user', content: user }],\n  };\n  if (c.temperature !== null && c.temperature !== undefined) req.temperature = c.temperature;\n  return { json: { ...$json, _stage_start: new Date().toISOString(), llm_request: req } };\n}\n\nreturn buildRequest(SYSTEM, USER);\n"
+      },
+      "id": "527f1a15-4540-4961-96c5-c0130bcb1428",
+      "name": "Prepare Scope Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3140,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.config.llm_base_url }}/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.llm_request) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "id": "a7820a3f-33fc-4c09-894c-b63dcd89b6b8",
+      "name": "Agent 5: Scope Estimator",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3360,
+        520
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "\nfunction parseLLM(resp) {\n  const raw = resp?.choices?.[0]?.message?.content ?? '';\n  try { return JSON.parse(raw); } catch (e) {\n    const m = raw.match(/\\{[\\s\\S]*\\}/);\n    if (m) { try { return JSON.parse(m[0]); } catch (e2) {} }\n    return { _parse_error: true, _raw: raw };\n  }\n}\nfunction traceEntry(stage, prev, resp, parsed) {\n  return {\n    stage,\n    model: resp.model || prev.config.model,\n    start_time: prev._stage_start,\n    end_time: new Date().toISOString(),\n    input: prev.llm_request.messages,\n    output: parsed,\n    usage: { input: resp.usage?.prompt_tokens || 0, output: resp.usage?.completion_tokens || 0 },\n  };\n}\nfunction nextCtx(prevNodeName, stage) {\n  const prev = $(prevNodeName).item.json;\n  const parsed = parseLLM($json);\n  const ctx = { ...prev };\n  delete ctx.llm_request;\n  delete ctx._stage_start;\n  return { ctx, parsed, entry: traceEntry(stage, prev, $json, parsed) };\n}\n\nconst { ctx, parsed, entry } = nextCtx('Prepare Scope Prompt', 'scope_estimator');\nctx.trace_scope = [entry];\nctx.scope_estimates = parsed;\nreturn { json: ctx };\n"
+      },
+      "id": "7fe5ee83-d645-47ae-809b-95115576aacb",
+      "name": "Parse Scope",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3580,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "id": "2c44f41e-c669-4a6c-a077-d3bc04c22e26",
+      "name": "Merge Gap + Scope",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        3800,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Builds the final PRD package (markdown) for every outcome: PRD generated / awaiting PM review / insufficient input / error.\nconst j = { ...$json };\nconst ex = j.extraction || {};\nj.trace = [...(j.trace || []), ...(j.trace_gap || []), ...(j.trace_scope || [])];\ndelete j.trace_gap; delete j.trace_scope; delete j.llm_request; delete j._stage_start;\n\nconst cell = s => String(s ?? '').replace(/\\|/g, '\\\\|').replace(/\\r?\\n/g, ' ');\nconst li = (arr, f) => (arr && arr.length) ? arr.map(x => '- ' + f(x)).join('\\n') : '- _None_';\n\nlet status;\nif (j.error) status = 'error';\nelse if (j.prd?.prd_markdown) status = 'prd_generated';\nelse if (j.mode === 'extract_only' && ex.input_assessment?.sufficiency !== 'insufficient') status = 'awaiting_pm_review';\nelse status = 'insufficient_input';\nj.status = status;\n\nfunction extractionSection() {\n  const reqs = ex.requirements || [];\n  const rows = reqs.map(r => `| ${cell(r.id)} | ${cell(r.statement)} | ${cell(r.type)}${r.nfr_category ? ' / ' + cell(r.nfr_category) : ''} | ${cell(r.certainty)} | ${cell(r.priority_signal)} | \"${cell(r.source_quote)}\" |`).join('\\n');\n  return [\n    `**Input assessment:** ${cell(ex.input_assessment?.sufficiency || 'n/a')} - ${ex.input_assessment?.sufficiency_reason || ''}`,\n    ex.input_assessment?.summary ? `\\n**Summary:** ${ex.input_assessment.summary}` : '',\n    '\\n### Requirements',\n    reqs.length ? '| ID | Requirement | Type | Certainty | Priority signal | Source quote |\\n|----|----|----|----|----|----|\\n' + rows : '_No requirements could be extracted._',\n    '\\n### Stakeholders',\n    li(ex.stakeholders, s => `**${s.name}**${s.role ? ' (' + s.role + ')' : ''}: ${(s.viewpoints || []).join('; ')}`),\n    '\\n### Personas',\n    li(ex.personas, p => `**${p.name}**: ${(p.needs || []).join('; ')}`),\n    '\\n### Deadlines',\n    li(ex.deadlines, d => `${d.description}: ${d.date_or_period}`),\n    '\\n### Dependencies',\n    li(ex.dependencies, d => `${d.description} - owner: ${d.owner || 'unknown'}, status: ${d.status || 'unknown'}, ETA: ${d.eta || 'unknown'}${d.risk ? ' - RISK: ' + d.risk : ''}`),\n    '\\n### Contradictions (need stakeholder resolution)',\n    li(ex.contradictions, c => `**${c.topic}**: \"${c.source_a}\" vs \"${c.source_b}\" (${(c.stakeholders_involved || []).join(', ')})`),\n    '\\n### Ambiguities',\n    li(ex.ambiguities, a => `${a.item} - ${a.why_ambiguous} (\"${a.source_quote}\")`),\n    '\\n### Missing information / clarification questions',\n    li(ex.missing_information, m => `**${m.area}:** ${m.question}`),\n  ].join('\\n');\n}\n\nfunction storiesSection() {\n  const sizes = {};\n  (j.scope_estimates?.estimates || []).forEach(e => { sizes[e.story_id] = e; });\n  const rows = [];\n  for (const ep of (j.stories?.epics || [])) {\n    for (const f of (ep.features || [])) {\n      for (const s of (f.stories || [])) {\n        const est = sizes[s.story_id] || {};\n        const ac = (s.acceptance_criteria || []).map(a => (a.derived ? '(derived) ' : '') + a.text).join('<br>');\n        rows.push(`| ${cell(ep.epic_id + ' ' + ep.title)} | ${cell(f.feature_id + ' ' + f.title)} | ${cell(s.story_id)} | ${cell(s.story)} | ${cell(s.priority)} | ${cell(est.size || '-')}${est.underspecified ? ' ⚠' : ''} | ${cell(ac)} | ${cell(s.status || 'ready')} |`);\n      }\n    }\n  }\n  if (!rows.length) return '_No stories generated._';\n  return '| Epic | Feature | ID | User Story | Priority | Size | Acceptance Criteria | Status |\\n|----|----|----|----|----|----|----|----|\\n' + rows.join('\\n');\n}\n\nfunction scopeSection() {\n  const est = j.scope_estimates?.estimates || [];\n  if (!est.length) return '_No estimates._';\n  const sum = j.scope_estimates?.summary || {};\n  return `**Summary:** S=${sum.S ?? 0}, M=${sum.M ?? 0}, L=${sum.L ?? 0}, XL=${sum.XL ?? 0}, underspecified=${sum.underspecified_count ?? 0}\\n\\n` +\n    '| Story | Size | Confidence | Complexity signals | Underspecified |\\n|----|----|----|----|----|\\n' +\n    est.map(e => `| ${cell(e.story_id)} | ${cell(e.size)} | ${cell(e.confidence)} | ${cell((e.complexity_signals || []).join('; '))} | ${e.underspecified ? 'Yes - ' + cell(e.underspecified_reason) : 'No'} |`).join('\\n');\n}\n\nfunction gapSection() {\n  const g = j.gap_analysis || {};\n  return [\n    `**Readiness:** ${g.readiness || 'n/a'} - ${g.readiness_reason || ''}`,\n    '\\n| Gap | Category | Severity | Clarification question | Ask |\\n|----|----|----|----|----|',\n    ...(g.gaps || []).map(x => `| ${cell(x.gap_id)} | ${cell(x.category)} | ${cell(x.severity)} | ${cell(x.clarification_question)} | ${cell(x.ask_whom)} |`),\n    '\\n**Conflicts to resolve**',\n    li(g.conflicts_to_resolve, c => `**${c.topic}** - positions: ${(c.positions || []).join(' / ')} - decision owner: ${c.decision_owner || 'TBD'}`),\n    '\\n**Risks**',\n    li(g.risks, r => `${r.risk} (likelihood ${r.likelihood}, impact ${r.impact}) - ${r.mitigation_question}`),\n  ].join('\\n');\n}\n\nconst header = `<!-- PRD Genie run ${j.run_id} | status: ${status} | test: ${j.test_id || '-'} -->\\n`;\nlet md;\nif (status === 'prd_generated') {\n  md = header + j.prd.prd_markdown +\n    '\\n\\n---\\n## 11. Epics & User Stories\\n' + storiesSection() +\n    '\\n\\n## 12. Scope Estimates (T-shirt sizes)\\n' + scopeSection() +\n    '\\n\\n## 13. Gap Analysis & Clarification Questions\\n' + gapSection() +\n    '\\n\\n---\\n## Appendix A - Requirement Extraction (traceability)\\n' + extractionSection();\n} else if (status === 'awaiting_pm_review') {\n  md = header + '# Requirement Extraction - awaiting PM review\\n\\n' +\n    '> Human-in-the-loop: review / edit the `extraction` JSON, then POST it back with `\"mode\": \"from_extraction\"` to generate the PRD and stories.\\n\\n' +\n    extractionSection();\n} else if (status === 'insufficient_input') {\n  md = header + '# ⚠ Insufficient input - no PRD generated\\n\\n' +\n    `PRD Genie did not generate a PRD because ${j.stop_reason || ex.input_assessment?.sufficiency_reason || 'the input contains no concrete requirements'}. ` +\n    'Nothing has been filled in with assumptions. Please answer the questions below and re-run.\\n\\n' + extractionSection();\n} else {\n  md = header + `# PRD Genie error\\n\\n${j.error}\\n\\n` + extractionSection();\n}\nj.document_markdown = md;\n\n// Cost & latency accounting (for the cost analysis / observability write-up)\nconst c = j.config || {};\nconst tokIn = j.trace.reduce((a, t) => a + (t.usage?.input || 0), 0);\nconst tokOut = j.trace.reduce((a, t) => a + (t.usage?.output || 0), 0);\nj.usage_summary = {\n  llm_calls: j.trace.length,\n  input_tokens: tokIn,\n  output_tokens: tokOut,\n  est_cost_usd: +((tokIn * (c.price_per_1m_input_usd || 0) + tokOut * (c.price_per_1m_output_usd || 0)) / 1e6).toFixed(6),\n  latency_ms: Date.now() - new Date(j.started_at).getTime(),\n  per_stage: j.trace.map(t => ({ stage: t.stage, input_tokens: t.usage?.input || 0, output_tokens: t.usage?.output || 0,\n    latency_ms: new Date(t.end_time) - new Date(t.start_time) })),\n};\nreturn { json: j };\n"
+      },
+      "id": "bbb7092c-be9d-4835-9167-ef6f2138af3c",
+      "name": "Assemble PRD Package",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4040,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Deterministic quality checks (grounding / hallucination) + baseline expectations for T1-T12.\nconst j = { ...$json };\nconst ex = j.extraction || {};\nconst norm = s => String(s ?? '').toLowerCase().replace(/[“”]/g, '\"').replace(/[‘’]/g, \"'\").replace(/\\s+/g, ' ').trim();\nconst vals = o => o == null ? [] : typeof o === 'object' ? Object.values(o).flatMap(vals) : [String(o)];\nconst src = norm(j.input_text);\n\n// --- 1. Grounding: every source_quote must exist verbatim in the input -------------------------\nconst quotes = [];\nconst add = (kind, id, q) => { if (q) quotes.push({ kind, id, quote: q }); };\n(ex.requirements || []).forEach(r => add('requirement', r.id, r.source_quote));\n(ex.personas || []).forEach(p => add('persona', p.name, p.source_quote));\n(ex.stakeholders || []).forEach(s => add('stakeholder', s.name, s.source_quote));\n(ex.deadlines || []).forEach(d => add('deadline', d.description, d.source_quote));\n(ex.dependencies || []).forEach(d => add('dependency', d.description, d.source_quote));\n(ex.contradictions || []).forEach(c => { add('contradiction', c.topic, c.source_a); add('contradiction', c.topic, c.source_b); });\n(ex.ambiguities || []).forEach(a => add('ambiguity', a.item, a.source_quote));\nconst isGrounded = q => norm(q).replace(/^[\"']|[\"']$/g, '').split(/\\.\\.\\.|…/).map(s => s.trim()).filter(Boolean).every(p => src.includes(p));\nconst ungrounded = src ? quotes.filter(q => !isGrounded(q.quote)) : [];\n\n// --- 2. Numbers in extracted requirements must appear in the source (no rounding / invention) ---\nconst numText = (ex.requirements || []).map(r => [r.statement, ...(r.metrics || []).map(m => m.value)].join(' ')).join(' ');\nconst nums = [...new Set((numText.match(/\\d[\\d,.]*\\d|\\d/g) || []).map(n => n.replace(/[.,]+$/, '')))];\nconst ungroundedNumbers = src ? nums.filter(n => !src.includes(n.toLowerCase())) : [];\n\nj.quality = {\n  grounding_checked: !!src,\n  quotes_total: quotes.length,\n  quotes_grounded: quotes.length - ungrounded.length,\n  grounding_ratio: src ? (quotes.length ? +((quotes.length - ungrounded.length) / quotes.length).toFixed(3) : 1) : null,\n  ungrounded_items: ungrounded,\n  ungrounded_numbers: ungroundedNumbers,\n  hallucination_risk: (ungrounded.length || ungroundedNumbers.length) ? 'review' : 'low',\n};\n\n// --- 3. Baseline dataset expectations (Problem Statement table T1-T12) --------------------------\nconst reqs = ex.requirements || [];\nconst blob = norm(vals(ex).join(' '));\nconst reqBlob = norm(vals(reqs).join(' '));\nconst missBlob = norm(vals(ex.missing_information).join(' '));\nconst prdRaw = j.prd?.prd_markdown || '';\nconst prdMd = norm(prdRaw);\nconst stories = (j.stories?.epics || []).flatMap(e => (e.features || []).flatMap(f => f.stories || []));\nconst storyAC = stories.flatMap(s => s.acceptance_criteria || []);\nconst has = (s, ...keys) => keys.some(k => s.includes(k));\nconst C = (name, pass, detail = '') => ({ name, pass: !!pass, detail: String(detail) });\nconst suff = ex.input_assessment?.sufficiency;\nconst noPrd = !prdRaw;\nconst stated = reqs.filter(r => r.certainty === 'stated');\nconst contradictions = ex.contradictions || [];\n\nconst EXPECT = {\n  T1: () => [\n    C('Not flagged insufficient', suff !== 'insufficient', suff),\n    C('Filter by date range extracted', has(reqBlob, 'date')),\n    C('Filter by category extracted', has(reqBlob, 'category')),\n    C('Filter by status extracted', has(reqBlob, 'status')),\n    C('2-second load time extracted', /\\b2[\\s-]*(seconds?|secs?|s)\\b/.test(reqBlob)),\n    C('PM Sarah extracted', has(blob, 'sarah')),\n    C('Q3 deadline extracted', has(blob, 'q3')),\n    C('No requirements outside the transcript (all quotes grounded)', reqs.length > 0 && ungrounded.length === 0 && ungroundedNumbers.length === 0,\n      ungrounded.map(u => u.quote).concat(ungroundedNumbers).join(' | ')),\n  ],\n  T2: () => [\n    C('Flagged as ambiguous / insufficient', ['insufficient', 'partial'].includes(suff), suff),\n    C('Ambiguities listed', (ex.ambiguities || []).length >= 1),\n    C('Missing info listed (>=2)', (ex.missing_information || []).length >= 2),\n    C('Missing info covers metrics / format / users (>=2 of 3)', [has(missBlob, 'metric', 'kpi', 'measure'), has(missBlob, 'format', 'visual', 'chart', 'output'), has(missBlob, 'user', 'persona', 'audience', 'who')].filter(Boolean).length >= 2),\n    C('No specific requirements invented', stated.length === 0, `${stated.length} stated`),\n    C('No PRD generated from vague input', noPrd),\n  ],\n  T3: () => [\n    C('Contradiction identified', contradictions.length >= 1),\n    C('Flagged for stakeholder resolution', contradictions.some(c => c.needs_stakeholder_resolution)),\n    C('Contradiction covers refresh vs API calls', has(norm(vals(contradictions).join(' ')), '5 second', '5-second', '5s') && has(norm(vals(contradictions).join(' ')), 'api')),\n  ],\n  T4: () => {\n    const acSrc = norm(reqs.flatMap(r => r.acceptance_criteria_verbatim || []).join(' '));\n    const acStory = norm(storyAC.map(a => a.text).join(' '));\n    return [\n      C('AC \"PDF must include company logo\" extracted verbatim', has(acSrc, 'pdf must include company logo', 'company logo')),\n      C('AC \"CSV must preserve formulas\" extracted verbatim', has(acSrc, 'csv must preserve formulas', 'preserve formulas')),\n      C('User stories generated', stories.length >= 1, stories.length),\n      C('Stories use the logo criterion', has(acStory, 'logo')),\n      C('Stories use the formulas criterion', has(acStory, 'formula')),\n      C('No extra (derived) acceptance criteria added', storyAC.filter(a => a.derived).length === 0, storyAC.filter(a => a.derived).map(a => a.text).join(' | ')),\n    ];\n  },\n  T5: () => [\n    C('Flagged as insufficient', suff === 'insufficient', suff),\n    C('Missing info listed (>=3)', (ex.missing_information || []).length >= 3, (ex.missing_information || []).length),\n    C('Covers dashboard / real-time / budget', has(missBlob, 'dashboard') && has(missBlob, 'real-time', 'real time', 'realtime') && has(missBlob, 'budget')),\n    C('No gaps filled (no PRD generated)', noPrd),\n  ],\n  T6: () => [\n    C('Engineering viewpoint (microservices) captured', has(blob, 'microservice')),\n    C('Design viewpoint (single-page app) captured', has(blob, 'single-page', 'single page', 'spa')),\n    C('PM viewpoint (ship by March) captured', has(blob, 'march')),\n    C('Three stakeholders captured', (ex.stakeholders || []).length >= 3, (ex.stakeholders || []).length),\n    C('Tensions identified', contradictions.length >= 1, contradictions.length),\n  ],\n  T7: () => [\n    C('10,000 concurrent users (exact)', has(reqBlob, '10,000')),\n    C('200ms at p95 (exact)', has(reqBlob, '200ms', '200 ms') && has(reqBlob, 'p95')),\n    C('Salesforce REST API v52 (exact)', has(reqBlob, 'v52') && has(reqBlob, 'salesforce')),\n    C('Classified as NFRs (>=2)', reqs.filter(r => r.type === 'non_functional').length >= 2),\n    C('Numbers not rounded or modified', !has(reqBlob, '10k', '10 000', '0.2s', '0.2 s') && ungroundedNumbers.length === 0, ungroundedNumbers.join(', ')),\n  ],\n  T8: () => {\n    const pBlob = norm((ex.personas || []).map(p => p.name).join(' | '));\n    const sp = norm(stories.map(s => s.persona + ' ' + s.story).join(' | '));\n    return [\n      C('3 personas identified', (ex.personas || []).length >= 3, pBlob),\n      C('Admin persona', has(pBlob, 'admin')),\n      C('End User persona', has(pBlob, 'end user', 'end-user')),\n      C('Auditor persona', has(pBlob, 'auditor')),\n      C('Separate stories per persona', has(sp, 'admin') && has(sp, 'end user', 'end-user') && has(sp, 'auditor')),\n      C('No generic merged \"user\" stories', !stories.some(s => norm(s.persona) === 'user')),\n    ];\n  },\n  T9: () => [\n    C('Flagged as no requirements extractable', suff === 'insufficient', suff),\n    C('No requirements extracted', stated.length === 0),\n    C('No PRD generated', noPrd),\n  ],\n  T10: () => {\n    const dBlob = norm(vals(ex.dependencies).join(' '));\n    return [\n      C('SSO feature extracted', has(reqBlob, 'sso')),\n      C('Dependency on auth service / Team Alpha', has(dBlob, 'alpha') && has(dBlob, 'auth')),\n      C('Unknown ETA flagged as risk', (ex.dependencies || []).some(d => d.risk && has(norm(vals(d).join(' ')), 'unknown', 'eta'))),\n    ];\n  },\n  // T11 / T12 are evaluated on the T1 run (PRD from T1 extraction, stories from that PRD)\n  T11: () => {\n    const sections = ['product overview', 'goals and objectives', 'user personas', 'feature requirements', 'functional requirements',\n      'non-functional requirements', 'acceptance criteria', 'out of scope', 'dependencies', 'assumptions', 'open questions', 'timeline'];\n    const missing = sections.filter(s => !prdMd.includes(s));\n    const frIds = new Set(prdRaw.match(/FR-\\d{3}/g) || []);\n    return [\n      C('PRD generated', !noPrd),\n      C('All template sections present', missing.length === 0, missing.join(', ')),\n      C('FR count within extracted requirements', frIds.size > 0 && frIds.size <= reqs.length, `${frIds.size} FR vs ${reqs.length} REQ`),\n      C('No out-of-source features in PRD', !has(prdMd, 'export', 'competitor', 'sso', 'dark mode', 'salesforce')),\n    ];\n  },\n  T12: () => [\n    C('Epics produced', (j.stories?.epics || []).length >= 1),\n    C('User stories produced', stories.length >= 1, stories.length),\n    C('All stories in \"As a [user]\" format', stories.length > 0 && stories.every(s => /^as an? /i.test((s.story || '').trim()))),\n    C('Priority suggestions on all stories', stories.length > 0 && stories.every(s => ['must have', 'should have', 'nice to have'].includes(norm(s.priority)))),\n  ],\n};\n\nconst ids = j.test_id === 'T1' ? ['T1', 'T11', 'T12'] : (EXPECT[j.test_id] ? [j.test_id] : []);\nj.eval = ids.length ? {\n  results: ids.map(id => {\n    const checks = EXPECT[id]();\n    return { test_id: id, passed: checks.filter(c => c.pass).length, total: checks.length, pass: checks.every(c => c.pass), checks };\n  }),\n} : null;\nreturn { json: j };\n"
+      },
+      "id": "2a931ad8-556f-41d2-9e3f-a39139e3bd91",
+      "name": "Quality, Grounding & Eval Checks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4260,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Builds a Langfuse ingestion batch: 1 trace, 1 generation per agent call, scores for grounding & eval.\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json;\n  if (!j.config?.langfuse_enabled) continue;\n  const rid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 10);\n  const now = new Date().toISOString();\n  const traceId = j.run_id;\n  const batch = [{\n    id: rid(), timestamp: now, type: 'trace-create',\n    body: {\n      id: traceId, name: 'prd-genie', timestamp: j.started_at,\n      input: { input_text: j.input_text, mode: j.mode, input_type: j.input_type },\n      output: { status: j.status, document_markdown: j.document_markdown },\n      tags: ['prd-genie', j.source, j.status, ...(j.test_id ? ['baseline-eval', j.test_id] : [])],\n      metadata: { test_id: j.test_id, usage_summary: j.usage_summary, quality: j.quality, human_reviewed: j.human_reviewed },\n    },\n  }];\n  for (const t of (j.trace || [])) {\n    batch.push({\n      id: rid(), timestamp: now, type: 'generation-create',\n      body: {\n        id: rid(), traceId, name: t.stage, startTime: t.start_time, endTime: t.end_time, model: t.model,\n        input: t.input, output: t.output,\n        usage: { input: t.usage?.input || 0, output: t.usage?.output || 0, unit: 'TOKENS' },\n      },\n    });\n  }\n  const score = (name, value, comment) => batch.push({ id: rid(), timestamp: now, type: 'score-create', body: { id: rid(), traceId, name, value, comment } });\n  if (j.quality?.grounding_ratio !== null && j.quality?.grounding_ratio !== undefined) {\n    score('grounding_ratio', j.quality.grounding_ratio, `${j.quality.quotes_grounded}/${j.quality.quotes_total} source quotes found verbatim`);\n    score('ungrounded_numbers', j.quality.ungrounded_numbers.length, j.quality.ungrounded_numbers.join(', '));\n  }\n  for (const r of (j.eval?.results || [])) {\n    score(`eval_${r.test_id}`, +(r.passed / r.total).toFixed(3), r.checks.filter(c => !c.pass).map(c => 'FAIL: ' + c.name).join('; ') || 'all checks passed');\n  }\n  out.push({ json: { langfuse_host: j.config.langfuse_host, payload: { batch } } });\n}\nreturn out;\n"
+      },
+      "id": "3e0f3810-23ef-4b62-ba38-92d3f9b96956",
+      "name": "Build Langfuse Trace",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4500,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.langfuse_host }}/api/public/ingestion",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.payload) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "273db02b-426d-4410-beb4-c8b7007ce608",
+      "name": "Langfuse: Ingest Trace",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4720,
+        260
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// API response (webhook) / sub-workflow result (eval harness).\nconst j = $json;\nreturn {\n  json: {\n    run_id: j.run_id,\n    status: j.status,                       // prd_generated | awaiting_pm_review | insufficient_input | error\n    test_id: j.test_id,\n    mode: j.mode,\n    human_reviewed: j.human_reviewed,\n    error: j.error || null,\n    document_markdown: j.document_markdown, // full PRD package / extraction report\n    extraction: j.extraction || null,       // edit this and POST back with mode=from_extraction (human-in-the-loop)\n    prd_markdown: j.prd?.prd_markdown || null,\n    epics: j.stories?.epics || [],\n    scope_estimates: j.scope_estimates || null,\n    gap_analysis: j.gap_analysis || null,\n    quality: j.quality,\n    eval: j.eval,\n    usage: j.usage_summary,\n  },\n};\n"
+      },
+      "id": "273e1f8a-d98d-4fd4-9a9c-14f384c082fb",
+      "name": "Final Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4500,
+        560
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "22ea1042-f349-49e6-8f8a-b5c6903d40bb",
+      "name": "Run Baseline Eval (manual)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        1000
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Eval harness input. RUN_SET = 'baseline' runs the 10 baseline inputs (T11/T12 are checked on the T1 run);\n// 'samples' runs the sample transcripts, product brief and stakeholder notes from Resources/.\nconst RUN_SET = 'baseline';\n\nconst BASELINE = [\n  { test_id: 'T1', input_type: 'meeting_transcript', expected: 'Extract filter by date/category/status, 2-second load time, PM Sarah, Q3. No extra requirements.',\n    input_text: 'The user should be able to filter reports by date range, category, and status. Results must load in under 2 seconds. PM: Sarah. Deadline: Q3.' },\n  { test_id: 'T2', input_type: 'product_brief', expected: 'Flag as ambiguous, list missing info (metrics, format, users). No invented requirements.',\n    input_text: 'We need better reporting. Something like what Competitor X has.' },\n  { test_id: 'T3', input_type: 'meeting_transcript', expected: 'Identify contradiction (frequent refresh vs minimize calls); flag for stakeholder resolution.',\n    input_text: 'The dashboard should auto-refresh every 5 seconds. [Later in same meeting] Performance is critical, minimize API calls.' },\n  { test_id: 'T4', input_type: 'meeting_transcript', expected: 'Extract AC verbatim; user stories with these criteria; no extra criteria.',\n    input_text: 'Users need to export reports as PDF and CSV. PDF must include company logo. CSV must preserve formulas.' },\n  { test_id: 'T5', input_type: 'meeting_notes', expected: 'Flag insufficient; list missing (what dashboard, what real-time, what budget); no assumptions.',\n    input_text: 'Discussed dashboard... John mentioned something about real-time... budget TBD...' },\n  { test_id: 'T6', input_type: 'stakeholder_notes', expected: 'Capture all three viewpoints; identify tensions; do not favor one.',\n    input_text: 'Engineering wants microservices. Design wants single-page app. PM wants it shipped by March.' },\n  { test_id: 'T7', input_type: 'meeting_transcript', expected: 'Exact numbers (10K users, 200ms p95, Salesforce v52) as NFRs; no rounding.',\n    input_text: 'API must support 10,000 concurrent users. Response time < 200ms at p95. Must integrate with Salesforce REST API v52.' },\n  { test_id: 'T8', input_type: 'meeting_transcript', expected: '3 personas (Admin, End User, Auditor); separate stories each; no generic stories.',\n    input_text: 'Admins need bulk user management. End users need a simplified view. Auditors need read-only access with full history.' },\n  { test_id: 'T9', input_type: 'meeting_notes', expected: 'Flag no requirements extractable; no PRD from nothing.',\n    input_text: 'Meeting happened. Notes: none.' },\n  { test_id: 'T10', input_type: 'meeting_transcript', expected: 'Extract SSO; flag dependency on auth service / Team Alpha; unknown ETA as risk.',\n    input_text: 'SSO login requires the new auth service which is being built by Team Alpha. ETA unknown.' },\n].map(t => ({ ...t, mode: 'full' }));\n\nconst SAMPLES = [\n  { test_id: null, input_type: 'meeting_transcript', mode: 'full', label: 'Transcript 1', input_text: `=== TRANSCRIPT 1: Reporting Feature (Detailed) ===\nMeeting: Product Planning - Reporting Dashboard\nDate: March 15, 2026\nAttendees: Sarah (PM), Raj (Engineering Lead), Lisa (Design)\n\nSarah: Okay let's talk about the reporting feature. Users have been asking for this for months. The key requirement is that users should be able to filter reports by date range, category, and status.\n\nRaj: Makes sense. What about performance? If they're pulling large datasets we need to think about load times.\n\nSarah: Good point. Results must load in under 2 seconds. That's a hard requirement from the enterprise customers.\n\nLisa: Are we doing this as a new page or adding it to the existing dashboard?\n\nSarah: New dedicated page. But it should match our existing design system.\n\nRaj: Who owns this? And what's the timeline?\n\nSarah: I'm the PM owner. Deadline is end of Q3. Raj, your team would handle the backend. Lisa, we'd need designs by end of April.\n\nRaj: We'll need to decide on the data source. Are we querying live or using a pre-computed data warehouse?\n\nSarah: TBD on that. Let's decide after we see Lisa's designs and understand the query patterns.` },\n  { test_id: null, input_type: 'meeting_transcript', mode: 'full', label: 'Transcript 2', input_text: `=== TRANSCRIPT 2: AI Feature (Vague) ===\nMeeting: Quick Sync - AI Ideas\nDate: March 18, 2026\nAttendees: Tom (VP Product), Ananya (PM)\n\nTom: So I've been thinking, we really need to do something with AI. Competitors are all doing it. We need better reporting. Something like what Competitor X has. Their stuff looks really smart.\n\nAnanya: What specifically about their reporting do you like?\n\nTom: I don't know, just the whole thing. It feels intelligent. Can we just add AI to our reports? Make them smarter.\n\nAnanya: We'd need to scope this more. What data would the AI analyze? What outputs are we expecting?\n\nTom: Just figure it out. Everyone has AI now. We need AI too. Let's discuss again next week.` },\n  { test_id: null, input_type: 'meeting_transcript', mode: 'full', label: 'Transcript 3', input_text: `=== TRANSCRIPT 3: Dashboard (Contradictory Requirements) ===\nMeeting: Sprint Planning - Dashboard Updates\nDate: March 20, 2026\nAttendees: Mike (Engineering), Priya (PM), Kevin (DevOps)\n\nPriya: We need the dashboard to auto-refresh every 5 seconds so users always see the latest data.\n\nMike: That's going to be a lot of API calls. Each refresh hits our backend.\n\nKevin: Yeah, from a DevOps perspective, that's concerning. Performance is critical. We need to minimize API calls. Our infrastructure can't handle that load.\n\nPriya: But users complain that data is stale. They want real-time.\n\nMike: We could do WebSockets instead of polling. But that's a bigger project.\n\nPriya: Let's just do the 5-second refresh for now.\n\nKevin: I strongly disagree. We'll have outages.\n\nPriya: Okay we'll discuss this offline. Moving on.` },\n  { test_id: null, input_type: 'meeting_transcript', mode: 'full', label: 'Transcript 4', input_text: `=== TRANSCRIPT 4: Export Feature (Detailed with Acceptance Criteria) ===\nMeeting: Feature Review - Data Export\nDate: March 22, 2026\nAttendees: Ananya (PM), Dev Team\n\nAnanya: Users need to export reports as PDF and CSV. For the PDF export, it must include the company logo at the top of every page. For CSV, it must preserve formulas - so if a cell has a SUM formula, the CSV should export the formula, not just the value.\n\nDev: That's tricky for CSV. Most CSV implementations only export values.\n\nAnanya: I know, but that's the requirement from the finance team. They import into Excel and need the formulas intact.\n\nDev: Okay, we can do XLSX instead of plain CSV for the formula support.\n\nAnanya: That works. But the user-facing label should still say \"Export to CSV\" since that's what they're used to.` },\n  { test_id: null, input_type: 'meeting_transcript', mode: 'full', label: 'Transcript 5', input_text: `=== TRANSCRIPT 5: General Discussion (Incomplete Notes) ===\nMeeting: Standup Notes\nDate: March 25, 2026\nAttendees: Various\n\n- Discussed dashboard... something about real-time updates\n- John mentioned something about real-time... need to check\n- Budget for the project is TBD\n- Someone said we need to talk to the analytics team\n- Action item: follow up with design (who?)\n- Next meeting: sometime next week` },\n  { test_id: null, input_type: 'product_brief', mode: 'full', label: 'Product brief', input_text: `Product Brief: Advanced Analytics Dashboard\n=============================================\nAuthor: Priya Sharma, Product Manager\nDate: March 2026\nStatus: Draft\n\nOVERVIEW\nWe are building an analytics dashboard that gives business users visibility into key metrics without needing to write SQL queries or ask the data team. This is the #1 requested feature from our Enterprise customers.\n\nTARGET USERS\n- Business analysts who currently export data to Excel\n- Team leads who need weekly performance summaries\n- Executives who want a high-level overview without digging into details\n\nKEY REQUIREMENTS\n1. Dashboard should display 5 core metrics: revenue, active users, churn rate, NPS score, and support ticket volume\n2. Users should be able to filter by date range (last 7 days, 30 days, 90 days, custom)\n3. Data should refresh every 15 minutes (not real-time, to manage cost)\n4. Must support role-based access: executives see all data, team leads see their team only\n5. Export to PDF for monthly board reports\n\nCONSTRAINTS\n- Must integrate with our existing PostgreSQL data warehouse\n- Cannot use any third-party analytics tools (licensing cost concern)\n- Must be accessible on mobile (responsive design)\n- Target launch: Q3 2026\n\nOPEN QUESTIONS\n- Should we support custom dashboard layouts or ship a fixed layout first?\n- Do we need alerting (e.g., notify when churn exceeds 5%)?\n- What is the acceptable page load time? (Suggestion: under 3 seconds)\n\nCOMPETITORS\n- Competitor X has a similar dashboard but charges $50/user/month extra\n- Competitor Y has basic dashboards included in their Enterprise plan` },\n  { test_id: null, input_type: 'stakeholder_notes', mode: 'full', label: 'Stakeholder notes', input_text: `Stakeholder Notes - Raw Interview Excerpts\n=============================================\nThese are unstructured notes from stakeholder interviews.\nThey are intentionally incomplete and messy.\n\n\n--- Interview with Engineering Lead (Raj) ---\nDate: March 12\n\n\"The biggest issue right now is our API. It's slow. We need to optimize the query layer before adding any new features. If you're building a dashboard, make sure it doesn't hammer the database with expensive queries.\"\n\n\"We're moving to microservices architecture. The analytics service should be its own service, not bolted onto the monolith.\"\n\n\"For the data model, we should use the existing events table. It has everything we need. But it needs an index on the timestamp column — right now full table scans take 8+ seconds.\"\n\n\"I'd say we need at least 2 sprints for the backend work. Maybe 3 if we include the API redesign.\"\n\n\n--- Interview with Design Lead (Lisa) ---\nDate: March 13\n\n\"Users don't want another dashboard. They want answers. Every tool we've evaluated has too many charts and not enough insights.\"\n\n\"I'd like to explore a single-page app approach. But I know engineering prefers server-rendered pages for SEO. We'll need to discuss.\"\n\n\"Mobile is important but I don't want to compromise the desktop experience. Maybe we do desktop first and mobile as a fast follow.\"\n\n\"Can we add dark mode? Users have asked for it. Not critical but would be nice.\"\n\n\n--- Interview with VP Sales (Tom) ---\nDate: March 14\n\n\"I need this for the next board meeting. Can we get something out by end of March? Even if it's basic?\"\n\n\"Our top 3 enterprise accounts have specifically asked for this. If we don't ship by Q3, we risk losing at least one of them.\"\n\n\"I don't care about the tech details. Just make it look professional and give me a number I can show the board.\"\n\n\"Also, can it predict churn? That would be a game-changer for my team.\"\n\n[Note: Tom did not specify what data the churn prediction should use or what accuracy is acceptable]\n\n\n--- Interview with Customer Success (Nina) ---\nDate: March 15\n\n\"Customers want to see their own data, filtered by their account. Multi-tenant support is critical.\"\n\n\"Some customers have asked for white-labeling — putting their own logo on reports. Not sure if that's in scope.\"\n\n\"The biggest complaint I hear is 'I can't find what I need.' So search and filtering are more important than adding new metrics.\"` },\n];\n\nreturn (RUN_SET === 'samples' ? SAMPLES : BASELINE).map(t => ({ json: { source: 'eval', ...t } }));\n"
+      },
+      "id": "8d18b8e8-0fb4-411c-a9d1-0c1a068a2300",
+      "name": "Load Test Inputs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        1000
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "={{ $workflow.id }}",
+          "mode": "id"
+        },
+        "mode": "each",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "8824c268-34f9-4685-a21f-a0739e66a9a9",
+      "name": "Run PRD Genie per Input",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.1,
+      "position": [
+        440,
+        1000
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Aggregates the baseline run into a single report (copy report_markdown into your submission).\nconst rows = [];\nlet checksPassed = 0, checksTotal = 0, testsPassed = 0, testsTotal = 0, tokIn = 0, tokOut = 0, cost = 0;\nconst details = [];\nfor (const it of $input.all()) {\n  const r = it.json;\n  tokIn += r.usage?.input_tokens || 0; tokOut += r.usage?.output_tokens || 0; cost += r.usage?.est_cost_usd || 0;\n  const results = r.eval?.results || [{ test_id: r.test_id || r.run_id, passed: 0, total: 0, pass: null, checks: [] }];\n  for (const e of results) {\n    checksPassed += e.passed; checksTotal += e.total;\n    if (e.pass !== null) { testsTotal++; if (e.pass) testsPassed++; }\n    const failed = e.checks.filter(c => !c.pass).map(c => c.name + (c.detail ? ` (${c.detail})` : ''));\n    rows.push(`| ${e.test_id} | ${r.status} | ${e.pass === null ? 'n/a' : e.pass ? 'PASS' : 'FAIL'} | ${e.passed}/${e.total} | ${r.quality?.grounding_ratio ?? 'n/a'} | ${(r.usage?.input_tokens || 0) + (r.usage?.output_tokens || 0)} | ${(r.usage?.est_cost_usd || 0).toFixed(5)} | ${failed.join('; ').replace(/\\|/g, '/') || '-'} |`);\n    details.push({ test_id: e.test_id, status: r.status, pass: e.pass, checks: e.checks, run_id: r.run_id });\n  }\n}\nconst report = [\n  '# PRD Genie - Baseline Evaluation Report',\n  `Run at ${new Date().toISOString()}`,\n  '',\n  `**Tests passed:** ${testsPassed}/${testsTotal}  |  **Checks passed:** ${checksPassed}/${checksTotal} (${checksTotal ? (100 * checksPassed / checksTotal).toFixed(1) : 0}%)`,\n  `**Tokens:** ${tokIn} in / ${tokOut} out  |  **Estimated cost:** $${cost.toFixed(4)}  (avg $${(cost / Math.max(1, $input.all().length)).toFixed(4)} per input)`,\n  '',\n  '| Test | Pipeline status | Result | Checks | Grounding ratio | Tokens | Cost (USD) | Failed checks |',\n  '|----|----|----|----|----|----|----|----|',\n  ...rows,\n].join('\\n');\nreturn [{ json: { report_markdown: report, tests_passed: testsPassed, tests_total: testsTotal, checks_passed: checksPassed, checks_total: checksTotal, est_cost_usd: +cost.toFixed(6), details } }];\n"
+      },
+      "id": "12f7ab3a-2917-494b-abfd-7ff5892cfd16",
+      "name": "Baseline Eval Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        1000
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## PRD Genie - AI-Powered Product Documentation Assistant\n**Pattern: Sequential pipeline** (every input goes through the same stages) with a **router** for modes/insufficient input and a **parallel tail** (Gap Analyzer + Scope Estimator run after Story Breakdown).\n\n`Transcript / Brief / Notes -> Agent 1 Requirement Extractor -> Agent 2 PRD Generator -> Agent 3 Story Breakdown -> (Agent 4 Gap Analyzer || Agent 5 Scope Estimator) -> PRD package -> Grounding + eval checks -> Langfuse`\n\n**Grounding:** every extracted item carries a verbatim `source_quote` that is verified in code; numbers are checked against the source. Inputs with no stated requirements stop before PRD generation (no PRD from nothing).\n**Human-in-the-loop:** POST `mode=extract_only`, PM edits `extraction`, POST back with `mode=from_extraction`.",
+        "height": 300,
+        "width": 880,
+        "color": 4
+      },
+      "id": "50d77dad-0b74-4a67-9d58-7f54eaf46041",
+      "name": "Note: Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -260
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Setup (5 min)\n1. **OpenAI credential**: open each `Agent 1-5` node -> Credential -> *OpenAI account* (any OpenAI-compatible endpoint: change `llm_base_url` / `model` in **Pipeline Config & Guard**).\n2. **Langfuse**: create a *Basic Auth* credential (user = Langfuse public key `pk-lf-...`, password = secret key `sk-lf-...`) and select it in **Langfuse: Ingest Trace**. Set `langfuse_host` in config, or `langfuse_enabled: false`.\n3. **Save** the workflow (the eval harness calls this same workflow by id).\n4. **Eval:** click *Test workflow* on **Run Baseline Eval (manual)** -> open **Baseline Eval Report** -> `report_markdown`. Set `RUN_SET = 'samples'` in *Load Test Inputs* to run the Resources transcripts/brief/notes.\n5. **API:** activate, then `POST /webhook/prd-genie` with `{\"input_text\": \"...\"}`.",
+        "height": 300,
+        "width": 760,
+        "color": 5
+      },
+      "id": "6e56e2e9-9e81-4547-9e16-f51a0a82f1d4",
+      "name": "Note: Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        900,
+        -260
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Evaluation harness (Problem Statement baseline T1-T12)\nRuns T1-T10 through the pipeline (one sub-execution per input, each traced in Langfuse). T11 (PRD from T1 extraction) and T12 (stories from T11 PRD) are checked on the T1 run. Checks are deterministic keyword / structure / grounding tests mirroring the \"Expected Output Must Contain\" column; scores are also sent to Langfuse as `eval_Tx`.",
+        "height": 160,
+        "width": 880,
+        "color": 6
+      },
+      "id": "9c20e10a-964f-467d-85a9-d35e7e02bdad",
+      "name": "Note: Eval",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        800
+      ]
+    }
+  ],
+  "connections": {
+    "PRD Genie API (POST /prd-genie)": {
+      "main": [
+        [
+          {
+            "node": "Normalize API Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize API Input": {
+      "main": [
+        [
+          {
+            "node": "Pipeline Config & Guard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Called by Eval Harness": {
+      "main": [
+        [
+          {
+            "node": "Pipeline Config & Guard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pipeline Config & Guard": {
+      "main": [
+        [
+          {
+            "node": "Route: Entry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route: Entry": {
+      "main": [
+        [
+          {
+            "node": "Prepare Extractor Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare PRD Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Assemble PRD Package",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Extractor Prompt": {
+      "main": [
+        [
+          {
+            "node": "Agent 1: Requirement Extractor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Agent 1: Requirement Extractor": {
+      "main": [
+        [
+          {
+            "node": "Parse Extraction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Extraction": {
+      "main": [
+        [
+          {
+            "node": "Route: After Extraction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route: After Extraction": {
+      "main": [
+        [
+          {
+            "node": "Prepare PRD Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Assemble PRD Package",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare PRD Prompt": {
+      "main": [
+        [
+          {
+            "node": "Agent 2: PRD Generator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Agent 2: PRD Generator": {
+      "main": [
+        [
+          {
+            "node": "Parse PRD",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse PRD": {
+      "main": [
+        [
+          {
+            "node": "Prepare Story Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Story Prompt": {
+      "main": [
+        [
+          {
+            "node": "Agent 3: Story Breakdown",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Agent 3: Story Breakdown": {
+      "main": [
+        [
+          {
+            "node": "Parse Stories",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Stories": {
+      "main": [
+        [
+          {
+            "node": "Prepare Gap Prompt",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Prepare Scope Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Gap Prompt": {
+      "main": [
+        [
+          {
+            "node": "Agent 4: Gap Analyzer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Agent 4: Gap Analyzer": {
+      "main": [
+        [
+          {
+            "node": "Parse Gaps",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Scope Prompt": {
+      "main": [
+        [
+          {
+            "node": "Agent 5: Scope Estimator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Agent 5: Scope Estimator": {
+      "main": [
+        [
+          {
+            "node": "Parse Scope",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Gaps": {
+      "main": [
+        [
+          {
+            "node": "Merge Gap + Scope",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Scope": {
+      "main": [
+        [
+          {
+            "node": "Merge Gap + Scope",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Gap + Scope": {
+      "main": [
+        [
+          {
+            "node": "Assemble PRD Package",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble PRD Package": {
+      "main": [
+        [
+          {
+            "node": "Quality, Grounding & Eval Checks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Quality, Grounding & Eval Checks": {
+      "main": [
+        [
+          {
+            "node": "Build Langfuse Trace",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Final Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Langfuse Trace": {
+      "main": [
+        [
+          {
+            "node": "Langfuse: Ingest Trace",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Baseline Eval (manual)": {
+      "main": [
+        [
+          {
+            "node": "Load Test Inputs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Test Inputs": {
+      "main": [
+        [
+          {
+            "node": "Run PRD Genie per Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run PRD Genie per Input": {
+      "main": [
+        [
+          {
+            "node": "Baseline Eval Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
